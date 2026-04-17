@@ -36,8 +36,4 @@ wget -q https://raw.githubusercontent.com/yuju520/YujuToolBox/main/yuju.sh && ch
 ## 项目参考
 https://github.com/kejilion/sh
 
-https://github.com/jerry048/Tune
-
-https://github.com/ztelliot/taierspeed-cli
-
 https://github.com/xykt/IPQuality
