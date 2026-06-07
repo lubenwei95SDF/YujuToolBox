@@ -34,6 +34,7 @@ wget -q https://raw.githubusercontent.com/lubenwei95SDF/YujuToolBox/main/yuju.sh
 - 系统管理、测试脚本、常用工具、Docker 管理。
 - 系统管理菜单支持创建普通 Linux 用户，可选密码、sudo 组和 SSH 公钥。
 - 3x-ui 安全部署菜单：安装/登录 Tailscale、配置 UFW 默认安全规则、生成/迁移 3x-ui Docker Compose。
+- 支持全新安装 3x-ui Docker Compose：默认面板只绑定 Tailscale IP，公开端口由用户输入。
 - 3x-ui 迁移会先备份 `/etc/x-ui` 和容器信息，保留旧容器为 `3x-ui.before-compose`，不会删除 Docker 卷。
 - bridge 网络模式会把 3x-ui 面板宿主机端口绑定到 Tailscale IP，并保留原有公开服务端口。
 - host 网络模式会保留 `network_mode: host`，并可把 3x-ui `webListen` 设置为 Tailscale IP。

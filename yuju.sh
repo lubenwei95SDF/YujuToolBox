@@ -1827,6 +1827,151 @@ xui_generate_compose() {
     esac
 }
 
+xui_write_fresh_public_ports_yaml() {
+    local public_ports="$1"
+    local panel_container_port="$2"
+    local mapping host_port container_port
+
+    for mapping in $public_ports; do
+        [ -z "$mapping" ] && continue
+        if echo "$mapping" | grep -q ':'; then
+            host_port="${mapping%%:*}"
+            container_port="${mapping#*:}"
+        else
+            host_port="$mapping"
+            container_port="$mapping"
+        fi
+
+        if ! echo "$host_port" | grep -Eq '^[0-9]+$' || ! echo "$container_port" | grep -Eq '^[0-9]+$'; then
+            echo "跳过无效端口映射: $mapping" >&2
+            continue
+        fi
+        if [ "$container_port" = "$panel_container_port" ]; then
+            echo "跳过面板容器端口，面板只绑定 Tailscale IP: $mapping" >&2
+            continue
+        fi
+        echo "      - \"${host_port}:${container_port}/tcp\""
+    done
+}
+
+xui_fresh_install_compose() {
+    root_test
+
+    local container image timezone tailscale_ip compose_dir compose_file data_dir cert_dir panel_container_port panel_host_port public_ports start_now confirm
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "Docker 未安装，先安装 Docker。"
+        docker_install || return 1
+    fi
+    if ! docker_compose_run version >/dev/null 2>&1; then
+        echo "Docker Compose 未安装，请先安装 docker compose 或 docker-compose。"
+        return 1
+    fi
+
+    tailscale_ip=$(xui_tailscale_ip)
+    if [ -z "$tailscale_ip" ]; then
+        read -p "未找到 Tailscale IPv4。现在安装/登录 Tailscale 吗？[y/N]: " confirm
+        case "$confirm" in
+            [Yy])
+                tailscale_install_config
+                tailscale_ip=$(xui_tailscale_ip)
+                ;;
+        esac
+    fi
+    if [ -z "$tailscale_ip" ]; then
+        echo "没有 Tailscale IPv4，不能安全绑定 3x-ui 面板。"
+        return 1
+    fi
+
+    read -p "3x-ui 容器名 [3x-ui]: " container
+    container="${container:-3x-ui}"
+    if ! echo "$container" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_.-]*$'; then
+        echo "容器名不合法: $container"
+        return 1
+    fi
+    if docker inspect "$container" >/dev/null 2>&1; then
+        echo "容器已存在: $container"
+        echo "已有容器请使用“生成/迁移 3x-ui Docker Compose”，不要走全新安装。"
+        return 1
+    fi
+
+    read -p "镜像 [ghcr.io/mhsanaei/3x-ui:latest]: " image
+    image="${image:-ghcr.io/mhsanaei/3x-ui:latest}"
+    read -p "Timezone [Asia/Shanghai]: " timezone
+    timezone="${timezone:-Asia/Shanghai}"
+    read -p "数据目录 [/opt/3x-ui/data]: " data_dir
+    data_dir="${data_dir:-/opt/3x-ui/data}"
+    read -p "证书目录 [/opt/3x-ui/cert]: " cert_dir
+    cert_dir="${cert_dir:-/opt/3x-ui/cert}"
+    read -p "面板容器端口 [2053]: " panel_container_port
+    panel_container_port="${panel_container_port:-2053}"
+    read -p "绑定到 Tailscale IP 的面板宿主机端口 [54321]: " panel_host_port
+    panel_host_port="${panel_host_port:-54321}"
+    if ! echo "$panel_container_port" | grep -Eq '^[0-9]+$' || ! echo "$panel_host_port" | grep -Eq '^[0-9]+$'; then
+        echo "面板端口必须是数字。"
+        return 1
+    fi
+    read -p "需要公网开放的 TCP 端口，空格分隔，支持 host:container [2096 8080]: " public_ports
+    public_ports="${public_ports:-2096 8080}"
+
+    if [ -d "$data_dir" ] && [ -n "$(find "$data_dir" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+        echo "数据目录非空: $data_dir"
+        read -p "继续复用这个目录吗？不会删除其中数据。[y/N]: " confirm
+        case "$confirm" in
+            [Yy]) ;;
+            *) echo "已取消。"; return 0 ;;
+        esac
+    fi
+
+    compose_dir="/opt/3x-ui-compose"
+    compose_file="${compose_dir}/docker-compose.yml"
+    mkdir -p "$compose_dir" "$data_dir" "$cert_dir"
+    if [ -f "$compose_file" ]; then
+        cp "$compose_file" "${compose_file}.bak.$(date +%F_%H%M%S)"
+        echo "已备份旧 Compose 文件。"
+    fi
+
+    {
+        echo "services:"
+        echo "  3x-ui:"
+        echo "    image: \"$(xui_yaml_escape "$image")\""
+        echo "    container_name: \"$(xui_yaml_escape "$container")\""
+        echo "    restart: \"unless-stopped\""
+        echo "    environment:"
+        echo "      TZ: \"$(xui_yaml_escape "$timezone")\""
+        echo "      XUI_ENABLE_FAIL2BAN: \"true\""
+        echo "    volumes:"
+        echo "      - \"$(xui_yaml_escape "$data_dir"):/etc/x-ui\""
+        echo "      - \"$(xui_yaml_escape "$cert_dir"):/root/cert\""
+        echo "    cap_add:"
+        echo "      - NET_ADMIN"
+        echo "      - NET_RAW"
+        echo "    ports:"
+        echo "      - \"${tailscale_ip}:${panel_host_port}:${panel_container_port}/tcp\""
+        xui_write_fresh_public_ports_yaml "$public_ports" "$panel_container_port"
+    } > "$compose_file"
+
+    echo "Compose 文件已写入: $compose_file"
+    if ! docker_compose_run -f "$compose_file" config >/dev/null; then
+        echo "Compose 配置校验失败，文件已保留: $compose_file"
+        return 1
+    fi
+    sed -n '1,220p' "$compose_file"
+
+    read -p "现在启动 3x-ui 吗？[Y/n]: " start_now
+    start_now="${start_now:-Y}"
+    case "$start_now" in
+        [Yy])
+            docker_compose_run -f "$compose_file" up -d || return 1
+            docker ps --format "table {{.Names}}\t{{.Ports}}"
+            echo "面板访问地址: http://${tailscale_ip}:${panel_host_port}"
+            echo "如需查看初始化日志: docker logs --tail=80 ${container}"
+            ;;
+        *)
+            echo "未启动。你可以之后执行: docker compose -f $compose_file up -d"
+            ;;
+    esac
+}
+
 xui_security_menu() {
     while true; do
         clear
@@ -1835,6 +1980,7 @@ xui_security_menu() {
         echo "2. 配置 UFW 默认安全规则"
         echo "3. 生成/迁移 3x-ui Docker Compose"
         echo "4. 查看 3x-ui 容器、挂载和端口"
+        echo "5. 全新安装 3x-ui Docker Compose"
         echo -e "${pink}========================${white}"
         echo "0. 返回"
         echo -e "${pink}========================${white}"
@@ -1844,6 +1990,7 @@ xui_security_menu() {
             2) clear; ufw_safe_setup ;;
             3) clear; xui_generate_compose ;;
             4) clear; xui_show_container_ports ;;
+            5) clear; xui_fresh_install_compose ;;
             0) yuju_menu ;;
             *) echo "无效的输入" ;;
         esac
