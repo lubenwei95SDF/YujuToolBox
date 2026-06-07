@@ -1515,13 +1515,21 @@ ufw_safe_setup() {
     root_test
     apt_install_if_missing ufw || return 1
 
-    local ssh_port public_ports admin_ip admin_port confirm
+    local ssh_port public_ports center_ips restricted_ports panel_ports allow_all_tailscale center_ip port confirm
     ssh_port=$(current_ssh_port)
 
-    echo "将保留 SSH 访问，并允许 tailscale0 网卡流量。"
-    echo "注意: Docker 映射端口可能绕过 UFW，3x-ui 面板仍应绑定到 Tailscale IP。"
+    echo "将保留 SSH 访问。默认不再把 3x-ui 订阅端口作为公网端口开放。"
+    echo "注意: Docker 映射到 0.0.0.0 的端口可能绕过 UFW；面板/订阅端口应绑定到 Tailscale IP。"
     read -p "需要放行的 SSH 端口 [${ssh_port}]: " input_ssh_port
     ssh_port="${input_ssh_port:-$ssh_port}"
+
+    read -p "xui-center 的 Tailscale IP，多个用空格分隔，留空则不配置中心机专用规则: " center_ips
+    read -p "只允许中心机访问的面板端口，空格分隔 [54321 2053]: " panel_ports
+    panel_ports="${panel_ports:-54321 2053}"
+    read -p "只允许中心机访问的订阅端口，空格分隔 [2096]: " restricted_ports
+    restricted_ports="${restricted_ports:-2096}"
+    read -p "需要公网开放的节点 TCP 端口，空格分隔，留空表示不开放: " public_ports
+    read -p "是否仍然允许整个 tailscale0 网卡流量？这会让 Tailnet 内其它机器也能访问。[y/N]: " allow_all_tailscale
 
     read -p "这会重置现有 UFW 规则，继续吗？[y/N]: " confirm
     case "$confirm" in
@@ -1533,20 +1541,38 @@ ufw_safe_setup() {
     ufw default deny incoming
     ufw default allow outgoing
     ufw allow "${ssh_port}/tcp" comment "SSH"
-    ufw allow in on tailscale0 comment "Tailscale"
 
-    read -p "需要公网开放的 TCP 端口，空格分隔 [2096 8080]: " public_ports
-    public_ports="${public_ports:-2096 8080}"
+    case "$allow_all_tailscale" in
+        [Yy]) ufw allow in on tailscale0 comment "Tailscale" ;;
+    esac
+
     for port in $public_ports; do
-        [ -n "$port" ] && ufw allow "${port}/tcp" comment "public-service"
+        if echo "$port" | grep -Eq '^[0-9]+$'; then
+            ufw allow "${port}/tcp" comment "public-node"
+        else
+            [ -n "$port" ] && echo "跳过无效公网端口: $port"
+        fi
     done
 
-    read -p "可选：允许访问面板的管理端来源 IP，留空跳过: " admin_ip
-    if [ -n "$admin_ip" ]; then
-        read -p "只允许 ${admin_ip} 访问的面板宿主机端口: " admin_port
-        if [ -n "$admin_port" ]; then
-            ufw allow from "$admin_ip" to any port "$admin_port" proto tcp comment "admin-panel"
-        fi
+    for center_ip in $center_ips; do
+        for port in $panel_ports; do
+            if echo "$port" | grep -Eq '^[0-9]+$'; then
+                ufw allow from "$center_ip" to any port "$port" proto tcp comment "xui-center-panel"
+            else
+                [ -n "$port" ] && echo "跳过无效面板端口: $port"
+            fi
+        done
+        for port in $restricted_ports; do
+            if echo "$port" | grep -Eq '^[0-9]+$'; then
+                ufw allow from "$center_ip" to any port "$port" proto tcp comment "xui-center-sub"
+            else
+                [ -n "$port" ] && echo "跳过无效订阅端口: $port"
+            fi
+        done
+    done
+
+    if [ -z "$center_ips" ]; then
+        echo "未配置 xui-center IP：面板/订阅端口不会添加中心机专用放行规则。"
     fi
 
     ufw --force enable
@@ -1652,11 +1678,34 @@ xui_write_mounts_yaml() {
     done <<< "$mounts"
 }
 
+xui_port_mapping_is_restricted() {
+    local host_port="$1"
+    local container_port="$2"
+    local restricted_ports="$3"
+    local mapping restricted_host restricted_container
+
+    for mapping in $restricted_ports; do
+        [ -z "$mapping" ] && continue
+        if echo "$mapping" | grep -q ':'; then
+            restricted_host="${mapping%%:*}"
+            restricted_container="${mapping#*:}"
+        else
+            restricted_host="$mapping"
+            restricted_container="$mapping"
+        fi
+        if [ "$host_port" = "$restricted_host" ] || [ "$container_port" = "$restricted_container" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 xui_write_bridge_ports_yaml() {
     local container="$1"
     local tailscale_ip="$2"
     local panel_container_port="$3"
     local panel_host_port="$4"
+    local restricted_ports="$5"
     local line container_part host_part host_ip host_port container_port proto key
     declare -A seen_ports=()
 
@@ -1681,7 +1730,11 @@ xui_write_bridge_ports_yaml() {
         if echo "$host_ip" | grep -q ':'; then
             continue
         fi
-        echo "      - \"${host_port}:${container_port}/${proto}\""
+        if xui_port_mapping_is_restricted "$host_port" "$container_port" "$restricted_ports"; then
+            echo "      - \"${tailscale_ip}:${host_port}:${container_port}/${proto}\""
+        else
+            echo "      - \"${host_port}:${container_port}/${proto}\""
+        fi
     done < <(docker port "$container" 2>/dev/null)
 }
 
@@ -1712,7 +1765,7 @@ xui_generate_compose() {
         return 1
     fi
 
-    local container image network_mode tailscale_ip timezone compose_dir compose_file volume_names_file backup db_dir db_file web_port panel_host_port input_port restart_policy set_listen migrate
+    local container image network_mode tailscale_ip timezone compose_dir compose_file volume_names_file backup db_dir db_file web_port panel_host_port input_port restart_policy restricted_ports set_listen migrate
     container=$(xui_prompt_container) || return 1
     image=$(docker inspect "$container" --format '{{.Config.Image}}')
     network_mode=$(docker inspect "$container" --format '{{.HostConfig.NetworkMode}}')
@@ -1741,6 +1794,8 @@ xui_generate_compose() {
     if [ "$network_mode" != "host" ]; then
         read -p "绑定到 Tailscale IP 的面板宿主机端口 [54321]: " input_port
         panel_host_port="${input_port:-54321}"
+        read -p "需要改为只绑定 Tailscale IP 的订阅端口，空格分隔，支持 host:container [2096]: " restricted_ports
+        restricted_ports="${restricted_ports:-2096}"
     fi
 
     compose_dir="/opt/3x-ui-compose"
@@ -1763,7 +1818,7 @@ xui_generate_compose() {
             echo "    cap_add:"
             echo "      - NET_ADMIN"
             echo "      - NET_RAW"
-            xui_write_bridge_ports_yaml "$container" "$tailscale_ip" "$web_port" "$panel_host_port"
+            xui_write_bridge_ports_yaml "$container" "$tailscale_ip" "$web_port" "$panel_host_port" "$restricted_ports"
         fi
         if [ -s "$volume_names_file" ]; then
             echo ""
@@ -1854,10 +1909,38 @@ xui_write_fresh_public_ports_yaml() {
     done
 }
 
+xui_write_fresh_restricted_ports_yaml() {
+    local tailscale_ip="$1"
+    local restricted_ports="$2"
+    local panel_container_port="$3"
+    local mapping host_port container_port
+
+    for mapping in $restricted_ports; do
+        [ -z "$mapping" ] && continue
+        if echo "$mapping" | grep -q ':'; then
+            host_port="${mapping%%:*}"
+            container_port="${mapping#*:}"
+        else
+            host_port="$mapping"
+            container_port="$mapping"
+        fi
+
+        if ! echo "$host_port" | grep -Eq '^[0-9]+$' || ! echo "$container_port" | grep -Eq '^[0-9]+$'; then
+            echo "跳过无效中心机专用端口映射: $mapping" >&2
+            continue
+        fi
+        if [ "$container_port" = "$panel_container_port" ]; then
+            echo "跳过面板容器端口，面板已有专用绑定: $mapping" >&2
+            continue
+        fi
+        echo "      - \"${tailscale_ip}:${host_port}:${container_port}/tcp\""
+    done
+}
+
 xui_fresh_install_compose() {
     root_test
 
-    local container image timezone tailscale_ip compose_dir compose_file data_dir cert_dir panel_container_port panel_host_port public_ports start_now confirm
+    local container image timezone tailscale_ip compose_dir compose_file data_dir cert_dir panel_container_port panel_host_port restricted_ports public_ports start_now confirm
     if ! command -v docker >/dev/null 2>&1; then
         echo "Docker 未安装，先安装 Docker。"
         docker_install || return 1
@@ -1910,8 +1993,9 @@ xui_fresh_install_compose() {
         echo "面板端口必须是数字。"
         return 1
     fi
-    read -p "需要公网开放的 TCP 端口，空格分隔，支持 host:container [2096 8080]: " public_ports
-    public_ports="${public_ports:-2096 8080}"
+    read -p "只走 Tailscale 的订阅端口，空格分隔，支持 host:container [2096]: " restricted_ports
+    restricted_ports="${restricted_ports:-2096}"
+    read -p "需要公网开放的节点 TCP 端口，空格分隔，支持 host:container，留空表示不开放: " public_ports
 
     if [ -d "$data_dir" ] && [ -n "$(find "$data_dir" -mindepth 1 -print -quit 2>/dev/null)" ]; then
         echo "数据目录非空: $data_dir"
@@ -1947,6 +2031,7 @@ xui_fresh_install_compose() {
         echo "      - NET_RAW"
         echo "    ports:"
         echo "      - \"${tailscale_ip}:${panel_host_port}:${panel_container_port}/tcp\""
+        xui_write_fresh_restricted_ports_yaml "$tailscale_ip" "$restricted_ports" "$panel_container_port"
         xui_write_fresh_public_ports_yaml "$public_ports" "$panel_container_port"
     } > "$compose_file"
 
