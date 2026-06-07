@@ -617,6 +617,71 @@ system_keygen() {
     cat ~/.ssh/id_rsa
 }
 
+# 1.10 创建普通 Linux 用户
+system_add_user() {
+    root_test
+
+    local username shell_path password add_sudo public_key ssh_dir
+    read -p "请输入要创建的普通用户名: " username
+    if [ -z "$username" ]; then
+        echo "用户名不能为空。"
+        return 1
+    fi
+    if ! [[ "$username" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+        echo "用户名格式不合法。建议使用小写字母、数字、下划线或短横线，且不要以数字开头。"
+        return 1
+    fi
+    if id "$username" >/dev/null 2>&1; then
+        echo "用户已存在: $username"
+        return 1
+    fi
+
+    read -p "登录 Shell [/bin/bash]: " shell_path
+    shell_path="${shell_path:-/bin/bash}"
+    if [ ! -x "$shell_path" ]; then
+        echo "Shell 不存在或不可执行: $shell_path"
+        return 1
+    fi
+
+    if command -v adduser >/dev/null 2>&1; then
+        adduser --disabled-password --gecos "" --shell "$shell_path" "$username" || return 1
+    else
+        useradd -m -s "$shell_path" "$username" || return 1
+    fi
+
+    read -s -p "设置登录密码，留空则不设置密码: " password
+    echo ""
+    if [ -n "$password" ]; then
+        echo "${username}:${password}" | chpasswd
+        echo "已设置密码。"
+    else
+        echo "未设置密码。需要密码登录时请之后执行: passwd $username"
+    fi
+
+    read -p "加入 sudo 组吗？[y/N]: " add_sudo
+    case "$add_sudo" in
+        [Yy])
+            apt_install_if_missing sudo || return 1
+            usermod -aG sudo "$username"
+            echo "已加入 sudo 组。"
+            ;;
+        *) echo "未加入 sudo 组。" ;;
+    esac
+
+    read -r -p "可选：粘贴 SSH 公钥，留空跳过: " public_key
+    if [ -n "$public_key" ]; then
+        ssh_dir="/home/${username}/.ssh"
+        mkdir -p "$ssh_dir"
+        printf '%s\n' "$public_key" > "${ssh_dir}/authorized_keys"
+        chown -R "${username}:${username}" "$ssh_dir"
+        chmod 700 "$ssh_dir"
+        chmod 600 "${ssh_dir}/authorized_keys"
+        echo "已写入 SSH 公钥: ${ssh_dir}/authorized_keys"
+    fi
+
+    echo "普通用户创建完成: $username"
+}
+
 # ═══════════════════════════════════════════════════════════════
 # 2. 测试脚本
 # ═══════════════════════════════════════════════════════════════
@@ -1282,6 +1347,393 @@ docker_uninstall() {
 # ═══════════════════════════════════════════════════════════════
 
 # 1. 系统相关子菜单
+# 5. 3x-ui secure deployment helpers
+apt_install_if_missing() {
+    local pkg="$1"
+    if command -v "$pkg" >/dev/null 2>&1; then
+        return 0
+    fi
+    apt-get update -y && apt-get install -y "$pkg"
+}
+
+docker_compose_run() {
+    if docker compose version >/dev/null 2>&1; then
+        docker compose "$@"
+        return $?
+    fi
+    if command -v docker-compose >/dev/null 2>&1; then
+        docker-compose "$@"
+        return $?
+    fi
+    return 127
+}
+
+current_ssh_port() {
+    local port
+    port=$(ss -lntp 2>/dev/null | awk '/sshd/ { sub(/.*:/, "", $4); print $4; exit }')
+    if [ -z "$port" ] && [ -f /etc/ssh/sshd_config ]; then
+        port=$(awk '$1 == "Port" { print $2; exit }' /etc/ssh/sshd_config)
+    fi
+    echo "${port:-22}"
+}
+
+tailscale_install_config() {
+    root_test
+    apt_install_if_missing curl || return 1
+
+    if ! command -v tailscale >/dev/null 2>&1; then
+        echo "Installing Tailscale..."
+        curl -fsSL https://tailscale.com/install.sh | sh
+    fi
+
+    systemctl enable --now tailscaled 2>/dev/null || true
+    echo "Starting tailscale login. If it prints a login URL, open it once."
+    tailscale up
+    echo "Tailscale IPv4:"
+    tailscale ip -4 2>/dev/null || true
+    tailscale status 2>/dev/null || true
+}
+
+ufw_safe_setup() {
+    root_test
+    apt_install_if_missing ufw || return 1
+
+    local ssh_port public_ports admin_ip admin_port confirm
+    ssh_port=$(current_ssh_port)
+
+    echo "将保留 SSH 访问，并允许 tailscale0 网卡流量。"
+    echo "注意: Docker 映射端口可能绕过 UFW，3x-ui 面板仍应绑定到 Tailscale IP。"
+    read -p "需要放行的 SSH 端口 [${ssh_port}]: " input_ssh_port
+    ssh_port="${input_ssh_port:-$ssh_port}"
+
+    read -p "这会重置现有 UFW 规则，继续吗？[y/N]: " confirm
+    case "$confirm" in
+        [Yy]) ;;
+        *) echo "已取消。"; return 0 ;;
+    esac
+
+    ufw --force reset
+    ufw default deny incoming
+    ufw default allow outgoing
+    ufw allow "${ssh_port}/tcp" comment "SSH"
+    ufw allow in on tailscale0 comment "Tailscale"
+
+    read -p "需要公网开放的 TCP 端口，空格分隔 [2096 8080]: " public_ports
+    public_ports="${public_ports:-2096 8080}"
+    for port in $public_ports; do
+        [ -n "$port" ] && ufw allow "${port}/tcp" comment "public-service"
+    done
+
+    read -p "可选：允许访问面板的管理端来源 IP，留空跳过: " admin_ip
+    if [ -n "$admin_ip" ]; then
+        read -p "只允许 ${admin_ip} 访问的面板宿主机端口: " admin_port
+        if [ -n "$admin_port" ]; then
+            ufw allow from "$admin_ip" to any port "$admin_port" proto tcp comment "admin-panel"
+        fi
+    fi
+
+    ufw --force enable
+    ufw status numbered
+}
+
+xui_tailscale_ip() {
+    tailscale ip -4 2>/dev/null | awk 'NF { print; exit }'
+}
+
+xui_prompt_container() {
+    local container
+    read -p "3x-ui container name [3x-ui]: " container
+    container="${container:-3x-ui}"
+    if ! docker inspect "$container" >/dev/null 2>&1; then
+        echo "未找到容器: $container" >&2
+        return 1
+    fi
+    echo "$container"
+}
+
+xui_db_dir() {
+    docker inspect "$1" --format '{{range .Mounts}}{{if eq .Destination "/etc/x-ui"}}{{println .Source}}{{end}}{{end}}' 2>/dev/null | awk 'NF { print; exit }'
+}
+
+xui_read_db_setting() {
+    local db_file="$1"
+    local key="$2"
+    if [ -f "$db_file" ] && command -v sqlite3 >/dev/null 2>&1; then
+        sqlite3 "$db_file" "select value from settings where key='${key}' limit 1;" 2>/dev/null
+    fi
+}
+
+xui_upsert_db_setting() {
+    local db_file="$1"
+    local key="$2"
+    local value="$3"
+    apt_install_if_missing sqlite3 || return 1
+    if [ ! -f "$db_file" ]; then
+        echo "DB not found: $db_file"
+        return 1
+    fi
+    cp "$db_file" "${db_file}.bak.$(date +%F_%H%M%S)"
+    sqlite3 "$db_file" "insert into settings(key,value) values('${key}','${value}') on conflict(key) do update set value=excluded.value;"
+}
+
+xui_yaml_escape() {
+    printf "%s" "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+xui_backup_container() {
+    local container="$1"
+    local backup="/root/3xui-backup-$(date +%F_%H%M%S)"
+    mkdir -p "$backup"
+    docker inspect "$container" > "$backup/docker-inspect.json"
+    docker cp "$container:/etc/x-ui" "$backup/etc-x-ui" >/dev/null 2>&1 || true
+    docker cp "$container:/root/cert" "$backup/root-cert" >/dev/null 2>&1 || true
+    echo "$backup"
+}
+
+xui_write_env_yaml() {
+    local container="$1"
+    local timezone="$2"
+    local envs
+    envs=$(docker inspect "$container" --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -v '^PATH=' | grep -v '^TZ=' || true)
+
+    echo "    environment:"
+    echo "      TZ: \"$(xui_yaml_escape "$timezone")\""
+    while IFS= read -r envline; do
+        [ -z "$envline" ] && continue
+        local key="${envline%%=*}"
+        local val="${envline#*=}"
+        echo "      ${key}: \"$(xui_yaml_escape "$val")\""
+    done <<< "$envs"
+}
+
+xui_write_mounts_yaml() {
+    local container="$1"
+    local volumes_file="$2"
+    local volume_names_file="$3"
+    local mounts
+    mounts=$(docker inspect "$container" --format '{{range .Mounts}}{{println .Type "|" .Name "|" .Source "|" .Destination}}{{end}}')
+
+    echo "    volumes:"
+    while IFS='|' read -r mtype mname msource mdest; do
+        mtype=$(echo "$mtype" | xargs)
+        mname=$(echo "$mname" | xargs)
+        msource=$(echo "$msource" | xargs)
+        mdest=$(echo "$mdest" | xargs)
+        [ -z "$mdest" ] && continue
+        if [ "$mtype" = "volume" ]; then
+            if [ -n "$mname" ]; then
+                echo "      - ${mname}:${mdest}"
+                if ! grep -qx "$mname" "$volume_names_file" 2>/dev/null; then
+                    echo "$mname" >> "$volume_names_file"
+                fi
+            else
+                echo "      - \"$(xui_yaml_escape "$msource"):${mdest}\""
+            fi
+        else
+            echo "      - \"$(xui_yaml_escape "$msource"):${mdest}\""
+        fi
+    done <<< "$mounts"
+}
+
+xui_write_bridge_ports_yaml() {
+    local container="$1"
+    local tailscale_ip="$2"
+    local panel_container_port="$3"
+    local panel_host_port="$4"
+    local line container_part host_part host_ip host_port container_port proto key
+    declare -A seen_ports=()
+
+    echo "    ports:"
+    echo "      - \"${tailscale_ip}:${panel_host_port}:${panel_container_port}/tcp\""
+    seen_ports["${panel_container_port}/tcp"]=1
+
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        container_part="${line%% -> *}"
+        host_part="${line#* -> }"
+        proto="${container_part##*/}"
+        container_port="${container_part%%/*}"
+        host_port="${host_part##*:}"
+        host_ip="${host_part%:*}"
+        key="${container_port}/${proto}"
+
+        [ "$key" = "${panel_container_port}/tcp" ] && continue
+        [ -n "${seen_ports[$key]}" ] && continue
+        seen_ports["$key"]=1
+
+        if echo "$host_ip" | grep -q ':'; then
+            continue
+        fi
+        echo "      - \"${host_port}:${container_port}/${proto}\""
+    done < <(docker port "$container" 2>/dev/null)
+}
+
+xui_show_container_ports() {
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "Docker 未安装。"
+        return 1
+    fi
+    local container
+    container=$(xui_prompt_container) || return 1
+    echo "Container: $container"
+    docker inspect "$container" --format 'Image={{.Config.Image}} NetworkMode={{.HostConfig.NetworkMode}}'
+    echo "Mounts:"
+    docker inspect "$container" --format '{{range .Mounts}}{{println .Type .Name .Source "->" .Destination}}{{end}}'
+    echo "Ports:"
+    docker port "$container" 2>/dev/null || true
+    echo "Tailscale IPv4: $(xui_tailscale_ip)"
+}
+
+xui_generate_compose() {
+    root_test
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "Docker 未安装。"
+        return 1
+    fi
+    if ! docker_compose_run version >/dev/null 2>&1; then
+        echo "Docker Compose 未安装，请先安装 docker compose 或 docker-compose。"
+        return 1
+    fi
+
+    local container image network_mode tailscale_ip timezone compose_dir compose_file volume_names_file backup db_dir db_file web_port panel_host_port input_port restart_policy set_listen migrate
+    container=$(xui_prompt_container) || return 1
+    image=$(docker inspect "$container" --format '{{.Config.Image}}')
+    network_mode=$(docker inspect "$container" --format '{{.HostConfig.NetworkMode}}')
+    restart_policy=$(docker inspect "$container" --format '{{.HostConfig.RestartPolicy.Name}}')
+    restart_policy="${restart_policy:-unless-stopped}"
+    tailscale_ip=$(xui_tailscale_ip)
+    if [ -z "$tailscale_ip" ]; then
+        echo "未找到 Tailscale IPv4，请先完成 Tailscale 安装/登录。"
+        return 1
+    fi
+
+    read -p "Timezone [Asia/Shanghai]: " timezone
+    timezone="${timezone:-Asia/Shanghai}"
+
+    backup=$(xui_backup_container "$container") || return 1
+    echo "备份已保存: $backup"
+
+    db_dir=$(xui_db_dir "$container")
+    db_file="${db_dir}/x-ui.db"
+    if [ -f "$db_file" ]; then
+        apt_install_if_missing sqlite3 || return 1
+    fi
+    web_port=$(xui_read_db_setting "$db_file" webPort)
+    web_port="${web_port:-2053}"
+
+    if [ "$network_mode" != "host" ]; then
+        read -p "绑定到 Tailscale IP 的面板宿主机端口 [54321]: " input_port
+        panel_host_port="${input_port:-54321}"
+    fi
+
+    compose_dir="/opt/3x-ui-compose"
+    compose_file="${compose_dir}/docker-compose.yml"
+    volume_names_file="$(mktemp)"
+    mkdir -p "$compose_dir"
+    : > "$volume_names_file"
+
+    {
+        echo "services:"
+        echo "  3x-ui:"
+        echo "    image: \"$(xui_yaml_escape "$image")\""
+        echo "    container_name: \"${container}\""
+        echo "    restart: \"${restart_policy}\""
+        xui_write_env_yaml "$container" "$timezone"
+        xui_write_mounts_yaml "$container" "$compose_file" "$volume_names_file"
+        if [ "$network_mode" = "host" ]; then
+            echo "    network_mode: \"host\""
+        else
+            echo "    cap_add:"
+            echo "      - NET_ADMIN"
+            echo "      - NET_RAW"
+            xui_write_bridge_ports_yaml "$container" "$tailscale_ip" "$web_port" "$panel_host_port"
+        fi
+        if [ -s "$volume_names_file" ]; then
+            echo ""
+            echo "volumes:"
+            while IFS= read -r vname; do
+                [ -n "$vname" ] && echo "  ${vname}:"
+                [ -n "$vname" ] && echo "    external: true"
+            done < "$volume_names_file"
+        fi
+    } > "$compose_file"
+    rm -f "$volume_names_file"
+
+    echo "Compose 文件已写入: $compose_file"
+    if ! docker_compose_run -f "$compose_file" config >/dev/null; then
+        echo "Compose 配置校验失败，文件已保留: $compose_file"
+        return 1
+    fi
+    echo "预览:"
+    sed -n '1,220p' "$compose_file"
+
+    if [ "$network_mode" = "host" ]; then
+        echo "检测到 host 网络模式。安全做法是把 3x-ui 的 webListen 设为 Tailscale IP。"
+        echo "当前 webListen: $(xui_read_db_setting "$db_file" webListen)"
+        read -p "迁移时设置 webListen=${tailscale_ip} 吗？[Y/n]: " set_listen
+        set_listen="${set_listen:-Y}"
+    fi
+
+    read -p "现在停止旧容器、重命名备份并启动 Compose 吗？[y/N]: " migrate
+    case "$migrate" in
+        [Yy])
+            docker stop "$container" || return 1
+            if docker inspect "${container}.before-compose" >/dev/null 2>&1; then
+                echo "已存在 ${container}.before-compose，请先手动处理。"
+                docker start "$container" >/dev/null 2>&1 || true
+                return 1
+            fi
+            docker rename "$container" "${container}.before-compose" || {
+                docker start "$container" >/dev/null 2>&1 || true
+                return 1
+            }
+            if [ "$network_mode" = "host" ] && [ "$set_listen" = "Y" -o "$set_listen" = "y" ]; then
+                xui_upsert_db_setting "$db_file" webListen "$tailscale_ip" || {
+                    docker rename "${container}.before-compose" "$container" >/dev/null 2>&1 || true
+                    docker start "$container" >/dev/null 2>&1 || true
+                    return 1
+                }
+            fi
+            if ! docker_compose_run -f "$compose_file" up -d; then
+                echo "Compose 启动失败，正在回滚旧容器。"
+                docker rm -f "$container" >/dev/null 2>&1 || true
+                docker rename "${container}.before-compose" "$container" >/dev/null 2>&1 || true
+                docker start "$container" >/dev/null 2>&1 || true
+                return 1
+            fi
+            docker ps --format "table {{.Names}}\t{{.Ports}}"
+            echo "旧容器已保留为 ${container}.before-compose，确认全部正常前不要删除。"
+            ;;
+        *)
+            echo "未执行迁移。你可以检查后手动执行: docker compose -f $compose_file up -d"
+            ;;
+    esac
+}
+
+xui_security_menu() {
+    while true; do
+        clear
+        echo -e "${pink}========================${white}"
+        echo "1. 安装/登录 Tailscale"
+        echo "2. 配置 UFW 默认安全规则"
+        echo "3. 生成/迁移 3x-ui Docker Compose"
+        echo "4. 查看 3x-ui 容器、挂载和端口"
+        echo -e "${pink}========================${white}"
+        echo "0. 返回"
+        echo -e "${pink}========================${white}"
+        read -p "请输入你的选择: " sub_choice
+        case $sub_choice in
+            1) clear; tailscale_install_config ;;
+            2) clear; ufw_safe_setup ;;
+            3) clear; xui_generate_compose ;;
+            4) clear; xui_show_container_ports ;;
+            0) yuju_menu ;;
+            *) echo "无效的输入" ;;
+        esac
+        break_end
+    done
+}
+
 system_related() {
     while true; do
         clear
@@ -1295,6 +1747,7 @@ system_related() {
         echo "7. 修改SSH端口"
         echo "8. 安装fail2ban"
         echo "9. 密钥登录"
+        echo "10. 创建普通用户"
         echo -e "${pink}========================${white}"
         echo "0. 返回主菜单"
         echo -e "${pink}========================${white}"
@@ -1309,6 +1762,7 @@ system_related() {
             7)  clear; system_ssh ;;
             8)  clear; system_fail2ban ;;
             9)  clear; system_keygen ;;
+            10) clear; system_add_user ;;
             0)  yuju_menu ;;
             *) echo "无效的输入!" ;;
         esac
@@ -1522,6 +1976,7 @@ yuju_menu() {
         echo "2. 测试脚本->"
         echo "3. 常用工具下载->"
         echo "4. Docker管理->"
+        echo "5. 3x-ui安全部署->"
         echo -e "${pink}============================${white}"
         echo "9. 一键优化"
         echo -e "${pink}============================${white}"
@@ -1536,6 +1991,7 @@ yuju_menu() {
             2)   clear; test_script ;;
             3)   clear; useful_tools ;;
             4)   clear; docker_manage ;;
+            5)   clear; xui_security_menu ;;
             9)   clear; onekey_optimization ;;
             555)
                 clear
