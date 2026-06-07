@@ -1202,31 +1202,148 @@ download_all() {
 # ═══════════════════════════════════════════════════════════════
 
 # 4.1 安装 Docker
-docker_install() {
-    clear
-    if command -v docker &> /dev/null; then
-        echo "Docker已经安装。"
+docker_os_release() {
+    local key="$1"
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        case "$key" in
+            id) echo "${ID:-}" ;;
+            codename) echo "${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}" ;;
+        esac
+    fi
+}
+
+docker_start_service() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl enable --now docker >/dev/null 2>&1 || systemctl restart docker >/dev/null 2>&1 || true
+    else
+        service docker restart >/dev/null 2>&1 || true
+    fi
+}
+
+docker_install_compose_fallback() {
+    if docker compose version >/dev/null 2>&1 || command -v docker-compose >/dev/null 2>&1; then
         return 0
     fi
-    local country
-    country=$(curl -s ipinfo.io/country)
-    if [ "$country" == "CN" ]; then
-        echo "本机器地理位置为中国，正在使用国内安装脚本..."
-        bash <(curl -sSL https://linuxmirrors.cn/docker.sh)
-        rm -f ./docker-install
-        echo "Docker安装完成，正在切换镜像源（由1panel提供）..."
-        touch /etc/docker/daemon.json
-        cat > /etc/docker/daemon.json << 'EOF'
+
+    apt-get update -y || return 1
+    if apt-cache show docker-compose-plugin >/dev/null 2>&1; then
+        apt-get install -y docker-compose-plugin && return 0
+    fi
+    if apt-cache show docker-compose >/dev/null 2>&1; then
+        apt-get install -y docker-compose && return 0
+    fi
+
+    echo "Docker Compose 未找到可安装包，Docker 本体已继续安装。"
+    return 0
+}
+
+docker_configure_cn_mirror() {
+    mkdir -p /etc/docker
+    if [ -f /etc/docker/daemon.json ]; then
+        cp /etc/docker/daemon.json "/etc/docker/daemon.json.bak.$(date +%F_%H%M%S)"
+    fi
+    cat > /etc/docker/daemon.json << 'EOF'
 {
     "registry-mirrors": ["https://docker.1panel.live"]
 }
 EOF
-    else
-        echo "本机器地理位置不在中国，正在使用官方Docker安装脚本..."
-        wget -qO- get.docker.com | bash
-        touch /etc/docker/daemon.json
+}
+
+docker_install_from_apt_repo() {
+    local os_id codename arch repo_url optional_pkg
+    os_id=$(docker_os_release id)
+    codename=$(docker_os_release codename)
+    arch=$(dpkg --print-architecture)
+
+    if [ -z "$os_id" ] || [ -z "$codename" ]; then
+        echo "无法识别系统发行版，不能自动添加 Docker APT 源。"
+        return 1
     fi
-    echo "Docker安装过程完成。"
+    if [ "$os_id" != "debian" ] && [ "$os_id" != "ubuntu" ]; then
+        echo "当前仅支持 Debian/Ubuntu 自动安装 Docker。"
+        return 1
+    fi
+
+    if [ "$os_id" = "debian" ] && [ "$codename" = "buster" ]; then
+        echo "检测到 Debian 10 buster。官方一键脚本已不稳定，将改用兼容 APT 安装方式。"
+    else
+        echo "正在使用 Docker 官方 APT 源安装。"
+    fi
+
+    apt-get update -y || return 1
+    apt-get install -y ca-certificates curl gnupg || return 1
+    install -m 0755 -d /etc/apt/keyrings || return 1
+
+    repo_url="https://download.docker.com/linux/${os_id}"
+    curl -fsSL "${repo_url}/gpg" -o /etc/apt/keyrings/docker.asc || return 1
+    chmod a+r /etc/apt/keyrings/docker.asc
+    echo "deb [arch=${arch} signed-by=/etc/apt/keyrings/docker.asc] ${repo_url} ${codename} stable" > /etc/apt/sources.list.d/docker.list
+
+    apt-get update -y || return 1
+
+    apt-get install -y docker-ce docker-ce-cli containerd.io || return 1
+
+    for optional_pkg in docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras; do
+        if apt-cache show "$optional_pkg" >/dev/null 2>&1; then
+            apt-get install -y "$optional_pkg" || echo "可选包安装失败，已跳过: $optional_pkg"
+        else
+            echo "跳过不可用包: $optional_pkg"
+        fi
+    done
+
+    docker_install_compose_fallback
+}
+
+docker_install() {
+    clear
+    root_test
+
+    local country
+    if command -v docker >/dev/null 2>&1; then
+        echo "Docker 已安装，检查 Compose 和服务状态..."
+        docker_install_compose_fallback
+        docker_start_service
+        docker --version
+        docker compose version 2>/dev/null || docker-compose --version 2>/dev/null || true
+        return 0
+    fi
+
+    apt-get install -y curl >/dev/null 2>&1 || true
+    if command -v curl >/dev/null 2>&1; then
+        country=$(curl -s --max-time 5 ipinfo.io/country 2>/dev/null || true)
+    else
+        country=""
+    fi
+
+    if [ "$country" = "CN" ]; then
+        echo "本机器地理位置为中国，优先使用国内安装脚本..."
+        if bash <(curl -fsSL https://linuxmirrors.cn/docker.sh); then
+            rm -f ./docker-install
+            echo "正在配置 Docker 国内镜像源..."
+            docker_configure_cn_mirror
+        else
+            echo "国内安装脚本失败，改用 Docker 官方 APT 源安装。"
+            docker_install_from_apt_repo || return 1
+        fi
+    else
+        echo "本机器地理位置不在中国，使用 Docker 官方 APT 源安装..."
+        docker_install_from_apt_repo || return 1
+    fi
+
+    docker_start_service
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "Docker 安装失败：docker 命令不存在。"
+        return 1
+    fi
+    if ! docker info >/dev/null 2>&1; then
+        echo "Docker 已安装，但 Docker 服务未正常启动，请检查: systemctl status docker"
+        return 1
+    fi
+
+    docker --version
+    docker compose version 2>/dev/null || docker-compose --version 2>/dev/null || echo "Docker Compose 未安装。"
+    echo "Docker 安装过程完成。"
 }
 
 # 4.2 查看 Docker 全局状态
