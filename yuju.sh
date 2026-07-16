@@ -1,6 +1,6 @@
 #!/bin/bash
 # 版本信息
-version="0.0.1"
+version="0.0.2"
 
 # ─── 颜色定义 ────────────────────────────────────────────────
 white='\033[0m'
@@ -2057,6 +2057,429 @@ xui_fresh_install_compose() {
     esac
 }
 
+# ═══════════════════════════════════════════════════════════════
+# 6. Realm 端口转发管理
+# ═══════════════════════════════════════════════════════════════
+
+realm_validate_service_account() {
+    local uid_min gid_min user_exists="false" group_exists="false"
+    local passwd_line group_line user_uid user_gid user_home user_shell
+    local group_gid group_members group_gid_count primary_users
+    local user_groups user_uid_count shadow_password
+
+    uid_min=$(awk '$1 == "UID_MIN" {print $2; exit}' /etc/login.defs 2>/dev/null)
+    gid_min=$(awk '$1 == "GID_MIN" {print $2; exit}' /etc/login.defs 2>/dev/null)
+    uid_min="${uid_min:-1000}"
+    gid_min="${gid_min:-1000}"
+
+    getent passwd realm >/dev/null 2>&1 && user_exists="true"
+    getent group realm >/dev/null 2>&1 && group_exists="true"
+
+    if [[ "$user_exists" == "true" ]] && ! grep -q '^realm:' /etc/passwd; then
+        echo "检测到来自远程 NSS 的同名 realm 用户，拒绝继续安装。"
+        return 1
+    fi
+    if [[ "$group_exists" == "true" ]] && ! grep -q '^realm:' /etc/group; then
+        echo "检测到来自远程 NSS 的同名 realm 组，拒绝继续安装。"
+        return 1
+    fi
+    if [[ "$user_exists" == "true" && "$group_exists" != "true" ]]; then
+        echo "realm 用户已存在但同名组不存在，拒绝继续安装。"
+        return 1
+    fi
+
+    if [[ "$group_exists" == "true" ]]; then
+        group_line=$(getent group realm)
+        IFS=: read -r _ _ group_gid group_members <<< "$group_line"
+        if [[ ! "$group_gid" =~ ^[0-9]+$ ]] || (( group_gid < 100 || group_gid >= gid_min )) || [[ -n "$group_members" ]]; then
+            echo "已有 realm 组不是空的系统组，拒绝复用。"
+            return 1
+        fi
+        group_gid_count=$(awk -F: -v id="$group_gid" '$3 == id {count++} END {print count + 0}' /etc/group)
+        if [[ "$group_gid_count" != "1" ]]; then
+            echo "realm 组的 GID 不是唯一值，拒绝复用。"
+            return 1
+        fi
+        primary_users=$(awk -F: -v gid="$group_gid" '$4 == gid {print $1}' /etc/passwd)
+        if [[ "$user_exists" == "true" ]]; then
+            if [[ "$primary_users" != "realm" ]]; then
+                echo "realm 组被其它用户作为主组使用，拒绝复用：$primary_users"
+                return 1
+            fi
+        elif [[ -n "$primary_users" ]]; then
+            echo "已有 realm 组被其它用户作为主组使用，拒绝复用：$primary_users"
+            return 1
+        fi
+    fi
+
+    if [[ "$user_exists" == "true" ]]; then
+        passwd_line=$(getent passwd realm)
+        IFS=: read -r _ _ user_uid user_gid _ user_home user_shell <<< "$passwd_line"
+        if [[ ! "$user_uid" =~ ^[0-9]+$ ]] || (( user_uid < 100 || user_uid >= uid_min )); then
+            echo "已有 realm 用户不是系统用户，拒绝复用。"
+            return 1
+        fi
+        user_uid_count=$(awk -F: -v id="$user_uid" '$3 == id {count++} END {print count + 0}' /etc/passwd)
+        if [[ "$user_uid_count" != "1" ]]; then
+            echo "realm 用户的 UID 不是唯一值，拒绝复用。"
+            return 1
+        fi
+        if [[ "$user_gid" != "$group_gid" || "$user_home" != "/nonexistent" ]]; then
+            echo "已有 realm 用户的主组或主目录不符合服务账户要求。"
+            return 1
+        fi
+        case "$user_shell" in
+            /usr/sbin/nologin|/sbin/nologin|/bin/false) ;;
+            *) echo "已有 realm 用户不是禁止登录账户，拒绝复用。"; return 1 ;;
+        esac
+        user_groups=$(id -Gn realm 2>/dev/null)
+        if [[ "$user_groups" != "realm" ]]; then
+            echo "已有 realm 用户属于额外用户组，拒绝复用：$user_groups"
+            return 1
+        fi
+        shadow_password=$(awk -F: '$1 == "realm" {print $2; exit}' /etc/shadow 2>/dev/null)
+        case "$shadow_password" in
+            "!"*|"*"*) ;;
+            *) echo "已有 realm 用户密码未锁定，拒绝复用。"; return 1 ;;
+        esac
+        return 0
+    fi
+
+    if [[ "$group_exists" != "true" ]]; then
+        groupadd --system realm || return 1
+    fi
+    useradd --system --gid realm --home-dir /nonexistent --no-create-home \
+        --shell /usr/sbin/nologin realm || return 1
+    usermod -L realm || return 1
+    realm_validate_service_account
+}
+
+realm_stage_binary() (
+    set -e
+    local asset_name="$1"
+    local tmp_dir release_json release_tag download_url published_digest expected_sha256
+    local archive realm_source
+
+    tmp_dir=$(mktemp -d)
+    trap 'rm -rf "$tmp_dir"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' HUP TERM
+
+    release_json="$tmp_dir/release.json"
+    archive="$tmp_dir/$asset_name"
+    curl -fsSL --retry 3 --connect-timeout 15 \
+        -H 'Accept: application/vnd.github+json' \
+        -H 'X-GitHub-Api-Version: 2022-11-28' \
+        'https://api.github.com/repos/zhboner/realm/releases/latest' \
+        -o "$release_json"
+
+    release_tag=$(jq -er '.tag_name | select(type == "string" and length > 0)' "$release_json")
+    download_url=$(jq -er --arg name "$asset_name" \
+        '.assets[] | select(.name == $name) | .browser_download_url' "$release_json")
+    published_digest=$(jq -er --arg name "$asset_name" \
+        '.assets[] | select(.name == $name) | .digest | select(type == "string" and startswith("sha256:"))' \
+        "$release_json")
+    expected_sha256="${published_digest#sha256:}"
+
+    echo "正在下载 Realm $release_tag..."
+    curl -fL --retry 3 --connect-timeout 15 "$download_url" -o "$archive"
+    printf '%s  %s\n' "$expected_sha256" "$archive" | sha256sum -c -
+
+    mkdir "$tmp_dir/extracted"
+    tar -xzf "$archive" -C "$tmp_dir/extracted"
+    realm_source=$(find "$tmp_dir/extracted" -type f -name realm -print -quit)
+    if [[ -z "$realm_source" ]]; then
+        echo "发布包中没有找到 realm 可执行文件。" >&2
+        exit 1
+    fi
+
+    install -m 0755 "$realm_source" /usr/local/bin/realm.new
+    /usr/local/bin/realm.new --version
+)
+
+realm_write_service_unit() {
+    local unit_path="$1"
+    cat > "$unit_path" <<'REALM_SERVICE'
+[Unit]
+Description=Realm network relay service
+Documentation=https://github.com/zhboner/realm
+Wants=network-online.target
+After=network-online.target
+ConditionPathIsExecutable=/usr/local/bin/realm
+ConditionPathIsReadable=/etc/realm/config.toml
+
+[Service]
+Type=exec
+User=realm
+Group=realm
+ExecStart=/usr/local/bin/realm -c /etc/realm/config.toml --log-output stdout
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=1048576
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
+REALM_SERVICE
+}
+
+realm_assert_active() {
+    local wait_seconds="${1:-2}"
+
+    sleep "$wait_seconds"
+    if systemctl is-active --quiet realm; then
+        return 0
+    fi
+
+    echo "Realm 未保持运行，请检查配置或端口占用。" >&2
+    systemctl status realm --no-pager -l || true
+    journalctl -u realm -n 50 --no-pager || true
+    return 1
+}
+
+realm_install_impl() (
+    set -e
+
+    local asset_name was_active="false" unit_stage_dir=""
+    local old_binary_backup="/usr/local/bin/realm.rollback.$$"
+    local old_unit_backup="/etc/systemd/system/realm.service.rollback.$$"
+    local had_binary="false" had_unit="false"
+    local replacement_started="false" install_succeeded="false"
+
+    cleanup_realm_install() {
+        local exit_status="$1"
+        trap - EXIT
+        trap '' INT HUP TERM
+        set +e
+
+        if [[ "$exit_status" != "0" && "$replacement_started" == "true" ]]; then
+            echo "Realm 新版本启动失败，正在回滚原版本..." >&2
+            if [[ "$had_binary" == "true" && -f "$old_binary_backup" ]]; then
+                mv -f "$old_binary_backup" /usr/local/bin/realm
+            else
+                rm -f /usr/local/bin/realm
+            fi
+            if [[ "$had_unit" == "true" && -f "$old_unit_backup" ]]; then
+                mv -f "$old_unit_backup" /etc/systemd/system/realm.service
+            else
+                rm -f /etc/systemd/system/realm.service
+            fi
+            systemctl daemon-reload
+            if [[ "$was_active" == "true" ]]; then
+                systemctl restart realm
+                realm_assert_active 1 || echo "原 Realm 服务也未能恢复，请查看上方日志。" >&2
+            fi
+        fi
+
+        rm -f /usr/local/bin/realm.new /etc/systemd/system/realm.service.new
+        if [[ "$install_succeeded" == "true" || "$replacement_started" != "true" ]]; then
+            rm -f "$old_binary_backup" "$old_unit_backup"
+        fi
+        if [[ -n "$unit_stage_dir" ]]; then
+            rm -rf "$unit_stage_dir"
+        fi
+
+        exit "$exit_status"
+    }
+    command -v flock >/dev/null 2>&1
+    exec 9>/run/lock/yuju-realm-install.lock
+    if ! flock -n 9; then
+        echo "另一个 Realm 安装/更新任务正在运行，请稍后重试。" >&2
+        exit 1
+    fi
+
+    trap 'cleanup_realm_install $?' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' HUP TERM
+
+    if systemctl is-active --quiet realm 2>/dev/null; then
+        was_active="true"
+    fi
+
+    command -v systemctl >/dev/null 2>&1
+    command -v systemd-analyze >/dev/null 2>&1
+    apt-get update
+    apt-get install -y --no-install-recommends ca-certificates curl jq tar
+
+    case "$(dpkg --print-architecture)" in
+        amd64) asset_name="realm-x86_64-unknown-linux-musl.tar.gz" ;;
+        arm64) asset_name="realm-aarch64-unknown-linux-musl.tar.gz" ;;
+        *)
+            echo "仅支持 Debian/Ubuntu amd64 和 arm64。当前架构：$(dpkg --print-architecture)"
+            exit 1
+            ;;
+    esac
+
+    rm -f /usr/local/bin/realm.new
+    realm_stage_binary "$asset_name"
+    realm_validate_service_account
+
+    install -d -o root -g realm -m 0750 /etc/realm
+    if [[ ! -e /etc/realm/config.toml ]]; then
+        cat > /etc/realm/config.toml <<'REALM_CONFIG'
+[log]
+level = "info"
+output = "stdout"
+
+[network]
+no_tcp = false
+use_udp = false
+
+# 取消下面三行的注释并填写转发规则。
+# [[endpoints]]
+# listen = "0.0.0.0:5000"
+# remote = "203.0.113.10:443"
+REALM_CONFIG
+    fi
+    chown root:realm /etc/realm/config.toml
+    chmod 0640 /etc/realm/config.toml
+
+    unit_stage_dir=$(mktemp -d)
+    realm_write_service_unit "$unit_stage_dir/realm.service"
+    sed 's#/usr/local/bin/realm#/usr/local/bin/realm.new#g' \
+        "$unit_stage_dir/realm.service" > "$unit_stage_dir/realm-verify.service"
+    systemd-analyze verify "$unit_stage_dir/realm-verify.service"
+
+    install -o root -g root -m 0644 "$unit_stage_dir/realm.service" \
+        /etc/systemd/system/realm.service.new
+
+    if [[ -f /usr/local/bin/realm ]]; then
+        cp -p /usr/local/bin/realm "$old_binary_backup"
+        had_binary="true"
+    fi
+    if [[ -f /etc/systemd/system/realm.service ]]; then
+        cp -p /etc/systemd/system/realm.service "$old_unit_backup"
+        had_unit="true"
+    fi
+
+    replacement_started="true"
+    mv -f /etc/systemd/system/realm.service.new /etc/systemd/system/realm.service
+    mv -f /usr/local/bin/realm.new /usr/local/bin/realm
+    systemctl daemon-reload
+
+    if [[ "$was_active" == "true" ]]; then
+        if systemctl restart realm && realm_assert_active; then
+            install_succeeded="true"
+            echo -e "${green}Realm 已更新并重启，现有配置未被覆盖。${white}"
+        else
+            exit 1
+        fi
+    else
+        install_succeeded="true"
+        echo -e "${green}Realm 安装完成，配置文件：/etc/realm/config.toml${white}"
+        echo "服务尚未启动。填写配置后在 Realm 菜单选择启动。"
+    fi
+)
+
+realm_install() {
+    local install_status
+
+    root_test
+    realm_install_impl
+    install_status=$?
+    if (( install_status != 0 )); then
+        echo -e "${red}Realm 安装/更新失败；已尝试回滚并恢复原服务，请检查上方结果。${white}"
+        return "$install_status"
+    fi
+}
+
+realm_config_edit() {
+    root_test
+    if [[ ! -f /etc/realm/config.toml ]]; then
+        echo "尚未找到 /etc/realm/config.toml，请先安装 Realm。"
+        return 1
+    fi
+
+    if command -v nano >/dev/null 2>&1; then
+        nano /etc/realm/config.toml
+    elif command -v vi >/dev/null 2>&1; then
+        vi /etc/realm/config.toml
+    else
+        apt-get update && apt-get install -y nano || return 1
+        nano /etc/realm/config.toml
+    fi
+    chown root:realm /etc/realm/config.toml
+    chmod 0640 /etc/realm/config.toml
+    echo "配置已保存；如服务正在运行，请选择重启 Realm。"
+}
+
+realm_service_enable() {
+    root_test
+    if [[ ! -x /usr/local/bin/realm || ! -f /etc/realm/config.toml ]]; then
+        echo "Realm 尚未安装完整，请先执行安装。"
+        return 1
+    fi
+    systemctl enable --now realm || return 1
+    realm_assert_active || return 1
+    systemctl status realm --no-pager -l
+}
+
+realm_service_restart() {
+    root_test
+    systemctl restart realm || return 1
+    realm_assert_active || return 1
+    systemctl status realm --no-pager -l
+}
+
+realm_service_stop() {
+    root_test
+    systemctl stop realm
+}
+
+realm_service_status() {
+    root_test
+    /usr/local/bin/realm --version 2>/dev/null || true
+    systemctl status realm --no-pager -l
+}
+
+realm_service_logs() {
+    root_test
+    journalctl -u realm -n 100 --no-pager
+}
+
+realm_menu() {
+    while true; do
+        clear
+        echo -e "${pink}========================${white}"
+        echo "1. 安装/更新 Realm"
+        echo "2. 编辑转发配置"
+        echo "3. 启动并设置开机自启"
+        echo "4. 重启 Realm"
+        echo "5. 查看状态"
+        echo "6. 查看最近 100 行日志"
+        echo "7. 停止 Realm"
+        echo -e "${pink}========================${white}"
+        echo "0. 返回主菜单"
+        echo -e "${pink}========================${white}"
+        read -p "请输入你的选择: " sub_choice
+        case $sub_choice in
+            1) clear; realm_install ;;
+            2) clear; realm_config_edit ;;
+            3) clear; realm_service_enable ;;
+            4) clear; realm_service_restart ;;
+            5) clear; realm_service_status ;;
+            6) clear; realm_service_logs ;;
+            7) clear; realm_service_stop ;;
+            0) return ;;
+            *) echo "无效的输入" ;;
+        esac
+        break_end
+    done
+}
+
 xui_security_menu() {
     while true; do
         clear
@@ -2326,6 +2749,7 @@ yuju_menu() {
         echo "3. 常用工具下载->"
         echo "4. Docker管理->"
         echo "5. 3x-ui安全部署->"
+        echo "6. Realm端口转发管理->"
         echo -e "${pink}============================${white}"
         echo "9. 一键优化"
         echo -e "${pink}============================${white}"
@@ -2341,6 +2765,7 @@ yuju_menu() {
             3)   clear; useful_tools ;;
             4)   clear; docker_manage ;;
             5)   clear; xui_security_menu ;;
+            6)   clear; realm_menu ;;
             9)   clear; onekey_optimization ;;
             555)
                 clear
